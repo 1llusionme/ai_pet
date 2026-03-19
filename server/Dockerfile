@@ -1,21 +1,21 @@
 FROM python:3.11-slim
 
-WORKDIR /workspace
+WORKDIR /workspace/server
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV MINDSHADOW_HOST=0.0.0.0
 ENV MINDSHADOW_PORT=8080
 
-COPY server/requirements.txt /workspace/server/requirements.txt
-COPY server/requirements-prod.txt /workspace/server/requirements-prod.txt
+COPY requirements.txt ./requirements.txt
+COPY requirements-prod.txt ./requirements-prod.txt
 
-RUN pip install --no-cache-dir -r /workspace/server/requirements-prod.txt
+RUN pip install --no-cache-dir -r ./requirements-prod.txt
 
-COPY server /workspace/server
+COPY . .
 
 RUN mkdir -p /workspace/data/uploads
 
 EXPOSE 8080
 
-CMD ["gunicorn", "-c", "server/gunicorn.conf.py", "server.wsgi:app"]
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "wsgi:app"]
