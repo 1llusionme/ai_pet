@@ -1,0 +1,6 @@
+server/.env.local
+**/.env.local
+**/.env
+mindshadow.db
+server/__pycache__/
+server/services/__pycache__/

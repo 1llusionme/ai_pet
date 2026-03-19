@@ -1,0 +1,40 @@
+name: MindShadowHybrid
+options:
+  minimumXcodeGenVersion: 2.38.0
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: com.mindshadow.app
+    SWIFT_VERSION: 5.9
+    IPHONEOS_DEPLOYMENT_TARGET: 16.0
+targets:
+  MindShadowHybrid:
+    type: application
+    platform: iOS
+    sources:
+      - path: ../NativeChatScaffold
+      - path: .
+        excludes:
+          - project.yml
+    settings:
+      base:
+        INFOPLIST_FILE: Info.plist
+        PRODUCT_NAME: MindShadow
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: MindShadow
+        UILaunchScreen:
+          UIColorName: ""
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: false
+schemes:
+  MindShadowHybrid:
+    build:
+      targets:
+        MindShadowHybrid: all
+    run:
+      config: Debug
+    archive:
+      config: Release
