@@ -43,7 +43,10 @@ def create_app() -> Flask:
     scheduler = ProactiveScheduler(memory_service=memory_service, llm_service=llm_service)
     scheduler.start()
     uploads_dir = Path(os.getenv("MINDSHADOW_UPLOAD_DIR", str(Path(__file__).resolve().parent / "uploads")))
-    web_dist_dir = Path(__file__).resolve().parent.parent / "docs" / "idea2mvp" / "teacherexam_ai" / "dist"
+    web_project_root = Path(__file__).resolve().parent.parent / "docs" / "idea2mvp"
+    web_dist_dir = web_project_root / "ai_teacherexam" / "dist"
+    if not web_dist_dir.exists():
+        web_dist_dir = web_project_root / "teacherexam_ai" / "dist"
     uploads_dir.mkdir(parents=True, exist_ok=True)
     rate_limit_max_requests = int(os.getenv("MINDSHADOW_RATE_LIMIT_MAX_REQUESTS_PER_MINUTE", "20"))
     rate_limit_window_seconds = 60
