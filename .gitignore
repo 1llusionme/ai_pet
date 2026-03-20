@@ -8,3 +8,4 @@ server/services/__pycache__/
 **/node_modules/
 **/dist/
 .DS_Store
+docs/idea2mvp/teacherexam_ai/知识库/*.pdf
