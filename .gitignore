@@ -9,3 +9,4 @@ server/services/__pycache__/
 **/dist/
 .DS_Store
 docs/idea2mvp/teacherexam_ai/知识库/*.pdf
+docs/idea2mvp/ai_teacherexam/知识库/*.pdf
