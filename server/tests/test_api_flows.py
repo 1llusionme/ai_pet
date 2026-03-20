@@ -610,13 +610,19 @@ class ApiFlowTests(unittest.TestCase):
         self.assertIn("学习卡片", payload["summary_card"]["title"])
         self.assertGreaterEqual(payload["term_cards_added"], 1)
         self.assertGreaterEqual(payload["review_records_created"], 1)
+        self.assertIsInstance(payload.get("cards"), list)
+        self.assertTrue(any(item.get("is_primary") for item in payload.get("cards", [])))
+        self.assertIn(payload.get("primary_card_type"), {"definition", "comparison", "steps", "mistake", "mnemonic"})
+        if payload.get("cards"):
+            self.assertIn(payload["cards"][0].get("card_type"), {"definition", "comparison", "steps", "mistake", "mnemonic"})
 
         cards = self.client.get(f"/api/memory-cards?user_id={user_id}")
         self.assertEqual(cards.status_code, 200)
         listed = cards.get_json()["cards"]
+        self.assertTrue(any(item.get("card_type") in {"definition", "comparison", "steps", "mistake", "mnemonic"} for item in listed))
         titles = [str(item["title"]) for item in listed]
         self.assertTrue(any(title.startswith("学习卡片：") for title in titles))
-        self.assertTrue(any(title.startswith("术语：") for title in titles))
+        self.assertTrue(any(title.startswith(prefix) for title in titles for prefix in ("定义卡：", "辨析卡：", "步骤卡：", "错因卡：", "速记卡：")))
 
     def test_learning_export_filters_gibberish_terms(self) -> None:
         user_id = "learning-export-clean-user"
@@ -634,8 +640,8 @@ class ApiFlowTests(unittest.TestCase):
         listed = cards.get_json()["cards"]
         titles = [str(item["title"]) for item in listed]
         self.assertTrue(any(title.startswith("学习卡片：") for title in titles))
-        self.assertFalse(any(title == "术语：构进行神人" for title in titles))
-        self.assertTrue(any(title in {"术语：教育目的", "术语：教学目标", "术语：课程标准"} for title in titles))
+        self.assertFalse(any(title.endswith("：构进行神人") for title in titles))
+        self.assertTrue(any(title.endswith("：教育目的") or title.endswith("：教学目标") or title.endswith("：课程标准") for title in titles))
 
     def test_memory_service_accepts_dynamic_term_whitelist(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -657,6 +663,174 @@ class ApiFlowTests(unittest.TestCase):
             terms = exported["terms"]
             self.assertIn("最近发展区", terms)
             self.assertIn("课堂提问链", terms)
+
+    def test_learning_export_prioritizes_meaningful_terms_and_term_limit(self) -> None:
+        user_id = "learning-export-priority-user"
+        original = os.environ.get("MINDSHADOW_EXPORT_TERM_LIMIT")
+        os.environ["MINDSHADOW_EXPORT_TERM_LIMIT"] = "4"
+        try:
+            export = self.client.post(
+                "/api/learning/export-answer",
+                json={
+                    "user_id": user_id,
+                    "source_question": "教学设计错题复盘",
+                    "answer_text": (
+                        "这题关键看教学目标、课程标准、形成性评价、终结性评价。"
+                        "其中教学目标是课堂达成标准，课程标准是学段框架，形成性评价用于过程反馈，终结性评价用于阶段判断。"
+                        "这个、那个、首先、然后这些词不是概念。"
+                    ),
+                },
+            )
+        finally:
+            if original is None:
+                os.environ.pop("MINDSHADOW_EXPORT_TERM_LIMIT", None)
+            else:
+                os.environ["MINDSHADOW_EXPORT_TERM_LIMIT"] = original
+        self.assertEqual(export.status_code, 200)
+        payload = export.get_json()["export"]
+        terms = payload["terms"]
+        self.assertLessEqual(len(terms), 2)
+        self.assertGreaterEqual(len(terms), 1)
+        self.assertTrue(any(item in {"教学目标", "课程标准", "形成性评价", "终结性评价"} for item in terms))
+        self.assertFalse(any(item in {"这个", "那个", "首先", "然后"} for item in terms))
+        self.assertEqual(payload["term_cards_limit"], 2)
+        decision = payload["export_decision"]
+        self.assertTrue(decision["allow_term_cards"])
+        self.assertIsNone(decision["reject_reason"])
+        self.assertGreaterEqual(len(payload["quality_scores"]), len(terms))
+
+    def test_learning_export_rejects_interrogative_noise_term(self) -> None:
+        user_id = "learning-export-noise-user"
+        export = self.client.post(
+            "/api/learning/export-answer",
+            json={
+                "user_id": user_id,
+                "source_question": "术语整理",
+                "answer_text": "**为什么：** **为什么：** 教学目标是课堂达成标准，课程标准用于学段要求。",
+            },
+        )
+        self.assertEqual(export.status_code, 200)
+        payload = export.get_json()["export"]
+        terms = payload["terms"]
+        self.assertFalse(any(item == "为什么" for item in terms))
+        cards = self.client.get(f"/api/memory-cards?user_id={user_id}")
+        self.assertEqual(cards.status_code, 200)
+        listed = cards.get_json()["cards"]
+        titles = [str(item["title"]) for item in listed]
+        self.assertFalse(any(title.endswith("：为什么") for title in titles))
+        self.assertTrue(any(title.endswith("：教学目标") or title.endswith("：课程标准") for title in titles))
+
+    def test_learning_export_avoids_generic_mnemonic_terms(self) -> None:
+        user_id = "learning-export-mnemonic-user"
+        export = self.client.post(
+            "/api/learning/export-answer",
+            json={
+                "user_id": user_id,
+                "source_question": "教学的基本任务是什么",
+                "answer_text": (
+                    "教学的基本任务包括德育、智育、体育、美育、劳动技术教育。"
+                    "记忆时可用口诀：德智体美劳。"
+                    "其中德育强调方向与价值引导。"
+                ),
+            },
+        )
+        self.assertEqual(export.status_code, 200)
+        payload = export.get_json()["export"]
+        self.assertFalse(any(item == "口诀记忆" or item == "记忆口诀" for item in payload["terms"]))
+        cards = payload.get("cards", [])
+        self.assertTrue(len(cards) >= 1)
+        self.assertTrue(any(str(card.get("card_type")) in {"definition", "comparison", "steps", "mistake"} for card in cards))
+        self.assertFalse(any(str(card.get("title", "")).endswith("：口诀记忆") for card in cards))
+
+    def test_learning_export_strips_trailing_qualifier_terms(self) -> None:
+        user_id = "learning-export-qualifier-user"
+        export = self.client.post(
+            "/api/learning/export-answer",
+            json={
+                "user_id": user_id,
+                "source_question": "德育的目标包括哪些",
+                "answer_text": (
+                    "德育目标主要包括思想目标、政治目标、道德目标、心理健康目标。"
+                    "核心是培养学生成为有理想、有道德、有文化、有纪律的社会主义建设者和接班人。"
+                ),
+            },
+        )
+        self.assertEqual(export.status_code, 200)
+        payload = export.get_json()["export"]
+        terms = payload["terms"]
+        self.assertFalse(any(str(term).endswith("主要") for term in terms))
+        self.assertTrue(any(str(term) == "德育目标" for term in terms))
+        cards = payload.get("cards", [])
+        self.assertFalse(any(str(card.get("term", "")).endswith("主要") for card in cards))
+
+    def test_learning_export_summary_card_has_structured_content(self) -> None:
+        user_id = "learning-export-structured-summary-user"
+        export = self.client.post(
+            "/api/learning/export-answer",
+            json={
+                "user_id": user_id,
+                "source_question": "德育的目标包括哪些",
+                "answer_text": (
+                    "德育目标主要包括思想目标、政治目标、道德目标、心理健康目标。"
+                    "核心是培养学生成为有理想、有道德、有文化、有纪律的社会主义建设者和接班人。"
+                ),
+            },
+        )
+        self.assertEqual(export.status_code, 200)
+        payload = export.get_json()["export"]
+        summary_content = str(payload["summary_card"]["content"])
+        self.assertIn("核心答案：", summary_content)
+        self.assertIn("答题动作：", summary_content)
+        self.assertIn("自测题：", summary_content)
+
+    def test_learning_export_returns_experience_feedback(self) -> None:
+        user_id = "learning-export-experience-user"
+        export = self.client.post(
+            "/api/learning/export-answer",
+            json={
+                "user_id": user_id,
+                "source_question": "教学的基本任务是什么",
+                "answer_text": "教学的基本任务包括德育、智育、体育、美育、劳动技术教育。",
+            },
+        )
+        self.assertEqual(export.status_code, 200)
+        payload = export.get_json()["export"]
+        experience = payload.get("experience")
+        self.assertIsInstance(experience, dict)
+        self.assertIn(str(experience.get("status")), {"cards_ready", "summary_only"})
+        self.assertTrue(str(experience.get("message", "")).strip())
+        self.assertTrue(str(experience.get("next_action", "")).strip())
+        generation = payload.get("generation")
+        self.assertIsInstance(generation, dict)
+        self.assertEqual(generation.get("strategy"), "hybrid_guardrailed")
+        self.assertIsInstance(generation.get("llm_enabled"), bool)
+        self.assertIsInstance(generation.get("llm_card_limit"), int)
+        cards = payload.get("cards", [])
+        for card in cards:
+            self.assertIn(str(card.get("generation_mode", "")), {"llm", "rule"})
+
+    def test_learning_export_gate_keeps_summary_when_content_is_noise(self) -> None:
+        user_id = "learning-export-gate-user"
+        export = self.client.post(
+            "/api/learning/export-answer",
+            json={
+                "user_id": user_id,
+                "source_question": "帮我整理",
+                "answer_text": "嗯嗯，好的！！！~~~",
+            },
+        )
+        self.assertEqual(export.status_code, 200)
+        payload = export.get_json()["export"]
+        self.assertEqual(payload["terms"], [])
+        self.assertEqual(payload["term_cards_added"], 0)
+        decision = payload["export_decision"]
+        self.assertFalse(decision["allow_term_cards"])
+        self.assertIn(decision["reject_reason"], {"too_short_no_structure", "insufficient_information", "high_noise_content"})
+        cards = self.client.get(f"/api/memory-cards?user_id={user_id}")
+        self.assertEqual(cards.status_code, 200)
+        titles = [str(item["title"]) for item in cards.get_json()["cards"]]
+        self.assertTrue(any(title.startswith("学习卡片：") for title in titles))
+        self.assertFalse(any(title.startswith(prefix) for title in titles for prefix in ("定义卡：", "辨析卡：", "步骤卡：", "错因卡：", "速记卡：")))
 
     def test_study_plan_generate_and_query_flow(self) -> None:
         user_id = "plan-user"
@@ -750,6 +924,27 @@ class ApiFlowTests(unittest.TestCase):
         self.assertGreaterEqual(summary["sent_count"], 1)
         self.assertGreaterEqual(summary["reengaged_count"], 1)
         self.assertGreater(summary["reengagement_rate"], 0)
+
+    def test_queue_notification_deduplicates_recent_same_content(self) -> None:
+        memory = MemoryService(db_path=os.environ["MINDSHADOW_DB_PATH"])
+        user_id = "nudge-dedupe-user"
+        content = "【学习节奏提醒】你最近在练教育学，来个30秒小挑战？"
+        memory.queue_notification(
+            user_id=user_id,
+            content=content,
+            trigger_type="inactivity",
+            nudge_level="focus",
+        )
+        memory.queue_notification(
+            user_id=user_id,
+            content=content,
+            trigger_type="inactivity",
+            nudge_level="focus",
+        )
+        first = memory.pop_pending_notification(user_id=user_id)
+        second = memory.pop_pending_notification(user_id=user_id)
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
 
     def test_nudge_strategy_summary_flow(self) -> None:
         memory = MemoryService(db_path=os.environ["MINDSHADOW_DB_PATH"])

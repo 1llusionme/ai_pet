@@ -127,10 +127,12 @@ class ProactiveScheduler:
             )
             focus_topic = self.memory_service.get_focus_topic(user_id)
             user_profile = self.memory_service.get_user_profile(user_id=user_id)
+            recent_messages = self.memory_service.get_recent_messages(user_id=user_id, limit=8)
             hook = self.llm_service.generate_hook(
                 focus_topic=focus_topic,
                 user_profile=user_profile,
                 nudge_level=nudge_level,
+                recent_messages=recent_messages,
             )
             content = f"{trigger_prefix.get(trigger_type, '【学习提醒】')}{hook}"
             self.memory_service.queue_notification(

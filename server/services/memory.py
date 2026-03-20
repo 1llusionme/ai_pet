@@ -1230,6 +1230,19 @@ class MemoryService:
     ) -> None:
         now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         with self._conn() as conn:
+            cutoff = (datetime.now(UTC) - timedelta(hours=6)).isoformat().replace("+00:00", "Z")
+            duplicated = conn.execute(
+                """
+                SELECT id
+                FROM notifications
+                WHERE user_id = ? AND content = ? AND created_at >= ? AND status IN ('pending', 'sent')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (user_id, content, cutoff),
+            ).fetchone()
+            if duplicated is not None:
+                return
             cursor = conn.execute(
                 """
                 INSERT INTO notifications (user_id, content, status, created_at)
@@ -1764,11 +1777,29 @@ class MemoryService:
                     tags = [str(item).strip() for item in parsed if str(item).strip()][:8]
             except json.JSONDecodeError:
                 tags = []
+        card_type = "definition"
+        for tag in tags:
+            if tag == "卡片类型:辨析卡":
+                card_type = "comparison"
+                break
+            if tag == "卡片类型:步骤卡":
+                card_type = "steps"
+                break
+            if tag == "卡片类型:错因卡":
+                card_type = "mistake"
+                break
+            if tag == "卡片类型:速记卡":
+                card_type = "mnemonic"
+                break
+            if tag == "卡片类型:定义卡":
+                card_type = "definition"
+                break
         return {
             "id": str(row["id"]),
             "title": str(row["title"] or ""),
             "content": str(row["content"] or ""),
             "tags": tags,
+            "card_type": card_type,
             "status": str(row["status"] or "active"),
             "created_at": str(row["created_at"] or ""),
             "updated_at": str(row["updated_at"] or ""),
@@ -1857,7 +1888,8 @@ class MemoryService:
         term = re.sub(r"[*_`~]+", "", term).strip()
         term = re.sub(r"^(先看|再看|看|先学|再学|学会|学习|复盘|梳理|理解|掌握|记住|区分|比较|围绕|关于)+", "", term).strip()
         term = re.sub(r"(这个错误写法|的区别|的定义|的概念|的作用|的意义)$", "", term).strip()
-        term = term.strip("：:;；，,。.!！？?()（）【】[]<>《》\"'“”‘’ ")
+        term = re.sub(r"(主要|通常|一般|核心|关键)$", "", term).strip()
+        term = term.strip("：:;；，,、。.!！？?()（）【】[]<>《》\"'“”‘’ ")
         term = re.sub(r"\s+", "", term)
         return term
 
@@ -1865,7 +1897,7 @@ class MemoryService:
         candidate = str(term or "").strip()
         if not candidate or len(candidate) < 2 or len(candidate) > 14:
             return False
-        if re.search(r"[，,。.!！？?；;：:\n]", candidate):
+        if re.search(r"[，,、。.!！？?；;：:\n]", candidate):
             return False
         if not re.search(r"[\u4e00-\u9fffA-Za-z]", candidate):
             return False
@@ -1897,6 +1929,12 @@ class MemoryService:
             return False
         if candidate in {"术语", "概念", "知识点", "方法", "结论", "重点"}:
             return False
+        if candidate in {"为什么", "怎么", "如何", "是否", "什么", "哪些", "哪个", "哪里", "多少", "怎么办"}:
+            return False
+        if candidate.endswith(("吗", "呢", "么")):
+            return False
+        if candidate.endswith(("主要", "通常", "一般", "核心", "关键")):
+            return False
         leading_or_trailing = "的是了着地得和与及并而又在对把被让给"
         if candidate[0] in leading_or_trailing or candidate[-1] in leading_or_trailing:
             return False
@@ -1905,64 +1943,91 @@ class MemoryService:
             return False
         return True
 
+    def _focus_term_quality_score(self, term: str, source_text: str, source_type: str) -> int:
+        candidate = str(term or "").strip()
+        if not candidate:
+            return -10
+        score = 0
+        if candidate in self.term_whitelist:
+            score += 5
+        if source_type in {"marked", "bolded", "quoted"}:
+            score += 2
+        if source_type == "definition":
+            score += 3
+        if source_type == "enumeration":
+            score += 2
+        if source_type == "chunk":
+            score += 1
+        if len(candidate) >= 3:
+            score += 1
+        if source_text.count(candidate) >= 2:
+            score += 1
+        if re.search(rf"{re.escape(candidate)}(?:是|指|属于|包括|强调|核心|区别于|不同于|用于)", source_text):
+            score += 2
+        if re.search(rf"(理论|原则|目标|标准|方法|模型|效应|概念|课程|教学|评价|动机|记忆|学习|发展|课堂|德育|智育|美育|教育)$", candidate):
+            score += 1
+        if re.search(r"(这个|那个|这样|那样|进行|通过|如果|因为|所以|首先|其次|最后)", candidate):
+            score -= 3
+        if candidate in {"术语", "概念", "知识点", "重点", "方法", "结论"}:
+            score -= 4
+        return score
+
     def _extract_focus_terms(self, text: str, limit: int = 8) -> list[str]:
         source = str(text or "")
         if not source:
             return []
-        terms: list[str] = []
-        seen: set[str] = set()
+        candidates: dict[str, int] = {}
+        cleaned_source = re.sub(r"\s+", " ", source)
+        max_limit = min(max(int(limit), 1), 8)
 
-        def add_term(raw: str) -> None:
+        def add_term(raw: str, source_type: str) -> None:
             term = self._sanitize_focus_term(raw)
             if not self._is_valid_focus_term(term):
                 return
-            if term in seen:
+            score = self._focus_term_quality_score(term=term, source_text=cleaned_source, source_type=source_type)
+            if score < 2:
                 return
-            seen.add(term)
-            terms.append(term)
+            previous = candidates.get(term)
+            if previous is None or score > previous:
+                candidates[term] = score
 
         for whitelist_term in self.term_whitelist:
             if whitelist_term in source:
-                add_term(whitelist_term)
-                if len(terms) >= limit:
-                    return terms[:limit]
+                add_term(whitelist_term, "whitelist")
         for marked in re.findall(r"==([^=\n]+)==", source):
-            add_term(marked)
-            if len(terms) >= limit:
-                return terms[:limit]
+            add_term(marked, "marked")
         for bolded in re.findall(r"\*\*([^*\n]+)\*\*", source):
-            add_term(bolded)
-            if len(terms) >= limit:
-                return terms[:limit]
+            add_term(bolded, "bolded")
         for quoted in re.findall(r"[“\"《]([^”\"》\n]{2,16})[”\"》]", source):
-            add_term(quoted)
-            if len(terms) >= limit:
-                return terms[:limit]
+            add_term(quoted, "quoted")
+        for enumeration in re.findall(r"((?:[\u4e00-\u9fffA-Za-z]{2,14}、){1,4}[\u4e00-\u9fffA-Za-z]{2,14})", source):
+            for item in enumeration.split("、"):
+                add_term(item, "enumeration")
 
         definition_matches = re.findall(
             r"(?:^|[，。；\s])([\u4e00-\u9fffA-Za-z]{2,14}?)(?:指的是|定义为|定义成|属于|包括|意味着|称为|叫做)",
             source,
         )
         for matched in definition_matches:
-            add_term(matched)
-            if len(terms) >= limit:
-                return terms[:limit]
+            add_term(matched, "definition")
 
-        sentence_parts = [part.strip() for part in re.split(r"[，,。；;！!？?\n]+", source) if part.strip()]
+        sentence_parts = [part.strip() for part in re.split(r"[，,、。；;！!？?\n]+", source) if part.strip()]
         connectors = r"(?:不是|并非|以及|和|与|再|先|后|然后|并且|或者|还是|通过|对照|围绕|关于|因为|所以)"
         for part in sentence_parts:
             chunks = [chunk.strip() for chunk in re.split(connectors, part) if chunk.strip()]
             for chunk in chunks:
-                add_term(chunk)
-                if len(terms) >= limit:
-                    return terms[:limit]
-
-        normalized = re.sub(r"[^\w\u4e00-\u9fff]+", " ", source)
-        for token in normalized.split():
-            add_term(token)
-            if len(terms) >= limit:
-                return terms[:limit]
-        return terms[:limit]
+                add_term(chunk, "chunk")
+        if not candidates:
+            return []
+        ranked = sorted(candidates.items(), key=lambda item: (item[1], len(item[0])), reverse=True)
+        selected: list[str] = []
+        for term, _score in ranked:
+            if any(term in existing and len(existing) >= len(term) + 2 for existing in selected):
+                continue
+            selected.append(term)
+            if len(selected) >= max_limit:
+                break
+        return selected
 
     def _extract_term_snippet(self, answer_text: str, term: str) -> str:
         lines = [str(line).strip() for line in str(answer_text or "").splitlines() if str(line).strip()]
@@ -1972,13 +2037,391 @@ class MemoryService:
         compact = " ".join(lines)
         return compact[:180]
 
+    def _normalize_term_snippet(self, snippet: str, term: str) -> str:
+        text = str(snippet or "")
+        text = re.sub(r"[*_`~#>]+", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(rf"(?:{re.escape(term)}[：:;；]?\s*){{2,}}", f"{term}：", text)
+        return text[:180]
+
+    def _is_meaningful_term_snippet(self, snippet: str, term: str) -> bool:
+        text = re.sub(r"\s+", " ", str(snippet or "").strip())
+        if len(text) < 8:
+            return False
+        if text == term:
+            return False
+        if re.fullmatch(rf"{re.escape(term)}[。.!！?？]?", text):
+            return False
+        normalized = re.sub(r"[：:;；，,、。.!！？?()\[\]{}<>《》\"'“”‘’\s]+", "", text)
+        if normalized and normalized.replace(term, "") == "":
+            return False
+        return bool(re.search(r"[\u4e00-\u9fffA-Za-z]{4,}", text))
+
+    def _card_type_label(self, card_type: str) -> str:
+        mapping = {
+            "definition": "定义卡",
+            "comparison": "辨析卡",
+            "steps": "步骤卡",
+            "mistake": "错因卡",
+            "mnemonic": "速记卡",
+        }
+        return mapping.get(card_type, "定义卡")
+
+    def _is_low_value_term(self, term: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(term or ""))
+        if not normalized:
+            return True
+        blocked_exact = {
+            "口诀",
+            "速记",
+            "记忆",
+            "口诀记忆",
+            "记忆口诀",
+            "口决记忆",
+            "这个",
+            "那个",
+            "这种",
+            "那个点",
+            "重点",
+            "前提",
+            "结论",
+            "行动建议",
+            "依据",
+        }
+        if normalized in blocked_exact:
+            return True
+        return bool(re.fullmatch(r"[A-Za-z]{1,2}", normalized))
+
+    def _extract_mnemonic_phrase(self, snippet: str) -> str:
+        text = str(snippet or "")
+        matched = re.search(
+            r"(?:口诀|速记|顺口溜|记忆点|记忆锚点|速记锚点)\s*[：:]\s*([^\n。；;，,]{2,24})",
+            text,
+        )
+        if not matched:
+            return ""
+        return re.sub(r"\s+", "", str(matched.group(1) or ""))
+
+    def _infer_learning_card_type(self, source_question: str, answer_text: str, term: str, snippet: str) -> str:
+        local_context = f"{term} {snippet}"
+        merged = f"{source_question} {answer_text} {local_context}"
+        if re.search(r"(错题|做错|老错|总错|易错|误区|纠错|复盘)", merged):
+            return "mistake"
+        if re.search(r"(怎么答|如何答|步骤|模板|先|再|最后|流程)", local_context):
+            return "steps"
+        if re.search(r"(区别|对比|辨析|不同|A与B|A和B)", local_context):
+            return "comparison"
+        has_mnemonic_signal = bool(re.search(r"(口诀|速记|记忆|口诀法|顺口溜)", local_context))
+        has_mnemonic_marker = bool(
+            re.search(
+                r"(口诀[:：]|速记[:：]|顺口溜[:：]|记忆点[:：]|记忆锚点[:：]|速记锚点[:：])",
+                str(snippet or ""),
+            )
+        )
+        mnemonic_phrase = self._extract_mnemonic_phrase(snippet)
+        normalized_term = re.sub(r"\s+", "", str(term or ""))
+        if has_mnemonic_signal and has_mnemonic_marker:
+            if re.search(r"(口诀|速记|记忆|顺口溜)", normalized_term) or (mnemonic_phrase and normalized_term in mnemonic_phrase):
+                return "mnemonic"
+        return "definition"
+
+    def _format_learning_card_content(self, card_type: str, term: str, snippet: str, source_question: str) -> str:
+        cleaned_snippet = str(snippet or "").strip()
+        question = str(source_question or "").strip()
+        if card_type == "comparison":
+            return "\n".join(
+                item
+                for item in (
+                    f"结论：围绕「{term}」做对照辨析，先明确比较维度再下结论。",
+                    "怎么做：先写共同点，再写关键差异，最后给出判定句。",
+                    f"行动建议：用「{term}」做一组A/B对比并口述判断依据。",
+                    f"依据：{cleaned_snippet}",
+                    f"来源问题：{question}" if question else "",
+                )
+                if item
+            )
+        if card_type == "steps":
+            return "\n".join(
+                item
+                for item in (
+                    f"结论：把「{term}」转成可执行步骤，按顺序作答。",
+                    "怎么做：先审题定位关键词，再套步骤模板，最后做自检。",
+                    f"行动建议：围绕「{term}」写出3步答题流程并做1题演练。",
+                    f"依据：{cleaned_snippet}",
+                    f"来源问题：{question}" if question else "",
+                )
+                if item
+            )
+        if card_type == "mistake":
+            return "\n".join(
+                item
+                for item in (
+                    f"结论：你在「{term}」上属于高频易错点，需要错因-修正闭环。",
+                    "为什么：常见原因是概念边界模糊或审题抓点不准。",
+                    f"行动建议：先复述「{term}」判断点，再做1道同类题并写依据。",
+                    f"依据：{cleaned_snippet}",
+                    f"来源问题：{question}" if question else "",
+                )
+                if item
+            )
+        if card_type == "mnemonic":
+            return "\n".join(
+                item
+                for item in (
+                    f"结论：把「{term}」压缩成速记锚点，临场快速调用。",
+                    "怎么记：优先记关键词顺序，再记触发场景。",
+                    f"行动建议：用15秒复述「{term}」并说出适用题型。",
+                    f"依据：{cleaned_snippet}",
+                    f"来源问题：{question}" if question else "",
+                )
+                if item
+            )
+        return "\n".join(
+            item
+            for item in (
+                f"结论：「{term}」的核心是先抓定义，再抓判断标准。",
+                "怎么用：作答时先给定义句，再补使用场景或边界。",
+                f"行动建议：用自己的话复述「{term}」并补1个判断点。",
+                f"依据：{cleaned_snippet}",
+                f"来源问题：{question}" if question else "",
+            )
+            if item
+        )
+
+    def _is_valid_generated_card_content(
+        self,
+        content: str,
+        term: str,
+        snippet: str,
+    ) -> bool:
+        normalized = str(content or "").strip()
+        if len(normalized) < 36 or len(normalized) > 980:
+            return False
+        required_labels = ("结论：", "行动建议：", "依据：")
+        if any(label not in normalized for label in required_labels):
+            return False
+        if str(term or "").strip() not in normalized:
+            return False
+        snippet_text = str(snippet or "").strip()
+        if snippet_text and len(snippet_text) >= 6 and snippet_text[:6] not in normalized:
+            return False
+        if re.search(r"(抱歉|无法|不能|作为AI|仅供参考)", normalized):
+            return False
+        return True
+
+    def _build_learning_card_content_hybrid(
+        self,
+        card_type: str,
+        term: str,
+        snippet: str,
+        source_question: str,
+        llm_service: Optional[Any] = None,
+    ) -> tuple[str, str]:
+        rule_content = self._format_learning_card_content(
+            card_type=card_type,
+            term=term,
+            snippet=snippet,
+            source_question=source_question,
+        )
+        if llm_service is None or not hasattr(llm_service, "generate_learning_card_copy"):
+            return rule_content, "rule"
+        try:
+            generated = llm_service.generate_learning_card_copy(
+                card_type=card_type,
+                term=term,
+                snippet=snippet,
+                source_question=source_question,
+            )
+        except Exception:
+            return rule_content, "rule"
+        if not isinstance(generated, dict):
+            return rule_content, "rule"
+        mode = str(generated.get("mode", "")).strip()
+        llm_content = str(generated.get("content", "")).strip()
+        if not llm_content:
+            return rule_content, "rule"
+        if not self._is_valid_generated_card_content(content=llm_content, term=term, snippet=snippet):
+            return rule_content, "rule"
+        normalized_mode = "llm" if mode.startswith("llm") else "rule"
+        return llm_content[:1000], normalized_mode
+
     def _has_mistake_signal(self, source_question: str, answer_text: str) -> bool:
         merged = f"{source_question} {answer_text}"
         if not merged.strip():
             return False
         return bool(re.search(r"(错题|做错|老错|总错|易错|误区|纠错|复盘)", merged))
 
-    def export_answer_to_learning_assets(self, user_id: str, source_question: str, answer_text: str) -> dict[str, Any]:
+    def _has_high_value_learning_structure(self, source_question: str, answer_text: str) -> bool:
+        merged = f"{source_question} {answer_text}"
+        if not merged.strip():
+            return False
+        return bool(
+            re.search(
+                r"(是什么|本质|定义|概念|区别|对比|辨析|怎么答|如何答|步骤|模板|错题|复盘|口诀|速记|"
+                r"指的是|定义为|包括|先|再|最后|用于|判断点|检查点)",
+                merged,
+            )
+        )
+
+    def _extract_answer_sentences(self, text: str, limit: int = 3) -> list[str]:
+        source = str(text or "")
+        if not source:
+            return []
+        sentences = [
+            item.strip()
+            for item in re.split(r"[。；;！!？?\n]+", source)
+            if item and len(re.sub(r"\s+", "", item)) >= 10
+        ]
+        if not sentences:
+            compact = re.sub(r"\s+", " ", source).strip()
+            return [compact[:120]] if compact else []
+        unique: list[str] = []
+        for sentence in sentences:
+            normalized = re.sub(r"\s+", "", sentence)
+            if any(normalized == re.sub(r"\s+", "", existing) for existing in unique):
+                continue
+            unique.append(sentence[:120])
+            if len(unique) >= max(1, min(limit, 6)):
+                break
+        return unique
+
+    def _extract_list_items_from_answer(self, source_question: str, answer_text: str, limit: int = 6) -> list[str]:
+        question = str(source_question or "")
+        answer = str(answer_text or "")
+        if not question or not answer:
+            return []
+        if not re.search(r"(包括|有哪些|构成|主要内容|包含|有哪些方面)", question):
+            return []
+        matched = re.search(r"(?:包括|包含|有)([^。；;\n]{4,160})", answer)
+        if not matched:
+            return []
+        raw_segment = str(matched.group(1) or "")
+        cleaned_segment = re.sub(r"(等|等方面|等内容)$", "", raw_segment).strip("：:，,。；; ")
+        if not cleaned_segment:
+            return []
+        raw_items = re.split(r"[、,，]|(?:以及|和|与|及)", cleaned_segment)
+        items: list[str] = []
+        for raw in raw_items:
+            item = self._sanitize_focus_term(raw)
+            if not item or item in items:
+                continue
+            if len(item) < 2 or len(item) > 12:
+                continue
+            if item.endswith(("方面", "内容", "问题")):
+                continue
+            items.append(item)
+            if len(items) >= max(1, min(limit, 8)):
+                break
+        return items
+
+    def _preferred_term_suffix(self, source_question: str) -> str:
+        question = str(source_question or "")
+        matched = re.search(r"(目标|任务|原则|步骤|标准|方法|作用|意义|特点|类型|维度)", question)
+        if not matched:
+            return ""
+        return str(matched.group(1) or "")
+
+    def _build_summary_card_content(self, source_question: str, answer_text: str) -> str:
+        question = str(source_question or "").strip()
+        answer = str(answer_text or "").strip()
+        sentences = self._extract_answer_sentences(answer, limit=3)
+        list_items = self._extract_list_items_from_answer(question, answer, limit=6)
+        core_sentence = sentences[0] if sentences else answer[:120]
+        support_sentence = sentences[1] if len(sentences) > 1 else ""
+        checklist = "、".join(list_items) if list_items else ""
+        return "\n".join(
+            item
+            for item in (
+                f"核心答案：{core_sentence}",
+                f"记忆清单：{checklist}" if checklist else "",
+                f"补充理解：{support_sentence}" if support_sentence else "",
+                "答题动作：先总述核心结论，再分点展开，最后补一句价值或边界。",
+                f"自测题：{question}" if question else "自测题：请用自己的话复述这题核心要点。",
+            )
+            if item
+        )
+
+    def _build_export_experience(
+        self,
+        export_gate: dict[str, Any],
+        exported_cards: list[dict[str, Any]],
+        term_cards_added: int,
+        term_cards_updated: int,
+    ) -> dict[str, Any]:
+        allow = bool(export_gate.get("allow_term_cards"))
+        if not allow:
+            reason = str(export_gate.get("reject_message", "")).strip() or "本次回答暂不适合生成术语卡。"
+            return {
+                "status": "summary_only",
+                "message": f"已生成学习主卡。{reason}",
+                "next_action": "建议先看主卡，再追问“请拆成可复习的3个术语卡”。",
+            }
+        if exported_cards:
+            lead_title = str(exported_cards[0].get("title", "学习卡片")).strip() or "学习卡片"
+            return {
+                "status": "cards_ready",
+                "message": f"已生成可复习卡片：新增{term_cards_added}，更新{term_cards_updated}。建议先看「{lead_title}」。",
+                "next_action": "打开学习资产库，先看主卡，再按顺序看重点卡。",
+            }
+        return {
+            "status": "summary_only",
+            "message": "已生成学习主卡，本次术语候选质量不足，未生成重点卡。",
+            "next_action": "可继续追问“请给我更结构化的分点答案”。",
+        }
+
+    def _learning_export_gate_decision(self, source_question: str, answer_text: str) -> dict[str, Any]:
+        text = str(answer_text or "")
+        normalized = re.sub(r"\s+", "", text)
+        semantic_chunks = re.findall(r"[\u4e00-\u9fffA-Za-z]{2,}", text)
+        punctuation_or_symbol = re.findall(r"[^\u4e00-\u9fffA-Za-z0-9]", text)
+        noise_ratio = (len(punctuation_or_symbol) / max(1, len(text))) if text else 1.0
+        has_structure = self._has_high_value_learning_structure(source_question=source_question, answer_text=answer_text)
+        if len(normalized) < 16 and not has_structure:
+            return {
+                "allow_term_cards": False,
+                "reject_reason": "too_short_no_structure",
+                "reject_message": "内容过短且缺少可复习结构，已仅保留学习总结卡。",
+            }
+        if len(semantic_chunks) < 3 and not has_structure:
+            return {
+                "allow_term_cards": False,
+                "reject_reason": "insufficient_information",
+                "reject_message": "有效学习信息不足，已仅保留学习总结卡。",
+            }
+        if noise_ratio >= 0.45 and not has_structure:
+            return {
+                "allow_term_cards": False,
+                "reject_reason": "high_noise_content",
+                "reject_message": "内容噪声较高，已仅保留学习总结卡。",
+            }
+        return {
+            "allow_term_cards": True,
+            "reject_reason": None,
+            "reject_message": "",
+        }
+
+    def _term_quality_score(self, term: str, snippet: str, source_question: str, answer_text: str) -> int:
+        base = self._focus_term_quality_score(term=term, source_text=answer_text, source_type="definition")
+        score = 58 + (base * 5)
+        if term and term in str(source_question or ""):
+            score += 6
+        if re.search(rf"{re.escape(term)}(?:是|指|属于|包括|用于|强调|核心)", str(answer_text or "")):
+            score += 8
+        if re.search(r"(先|再|最后|步骤|对照|检查|复述|完成|套用)", str(snippet or "")):
+            score += 6
+        if len(re.sub(r"\s+", "", str(snippet or ""))) < 14:
+            score -= 12
+        if not self._is_meaningful_term_snippet(snippet=snippet, term=term):
+            score -= 18
+        return max(0, min(score, 100))
+
+    def export_answer_to_learning_assets(
+        self,
+        user_id: str,
+        source_question: str,
+        answer_text: str,
+        llm_service: Optional[Any] = None,
+    ) -> dict[str, Any]:
         normalized_user_id = str(user_id or "default").strip() or "default"
         normalized_question = str(source_question or "").strip()[:400]
         normalized_answer = str(answer_text or "").strip()[:3000]
@@ -1986,23 +2429,131 @@ class MemoryService:
             raise ValueError("answer_text is required")
         base_title = normalized_question[:20] if normalized_question else "本轮学习总结"
         summary_title = f"学习卡片：{base_title}"
+        summary_content = self._build_summary_card_content(
+            source_question=normalized_question,
+            answer_text=normalized_answer,
+        )
         summary_card = self.create_memory_card(
             user_id=normalized_user_id,
             payload={
                 "title": summary_title,
-                "content": normalized_answer[:1000],
+                "content": summary_content[:1000],
                 "tags": ["学习导出", "聊天回答"],
             },
         )
-        terms = self._extract_focus_terms(normalized_answer, limit=8)
+        export_gate = self._learning_export_gate_decision(
+            source_question=normalized_question,
+            answer_text=normalized_answer,
+        )
+        raw_term_limit = str(os.getenv("MINDSHADOW_EXPORT_TERM_LIMIT", "4")).strip()
+        raw_supporting_limit = str(os.getenv("MINDSHADOW_EXPORT_SUPPORTING_CARD_LIMIT", "2")).strip()
+        try:
+            term_limit = int(raw_term_limit)
+        except ValueError:
+            term_limit = 4
+        try:
+            supporting_limit = int(raw_supporting_limit)
+        except ValueError:
+            supporting_limit = 2
+        supporting_limit = max(0, min(supporting_limit, 2))
+        extract_limit = max(1, min(max(term_limit, supporting_limit), 8))
+        terms = self._extract_focus_terms(normalized_answer, limit=extract_limit)
         term_cards_added = 0
         term_cards_updated = 0
         created_reviews: list[dict[str, Any]] = []
+        exported_terms: list[str] = []
+        quality_scores: list[dict[str, Any]] = []
         has_mistake_signal = self._has_mistake_signal(normalized_question, normalized_answer)
+        raw_main_threshold = str(os.getenv("MINDSHADOW_EXPORT_MAIN_SCORE_THRESHOLD", "75")).strip()
+        raw_support_threshold = str(os.getenv("MINDSHADOW_EXPORT_SUPPORT_SCORE_THRESHOLD", "68")).strip()
+        raw_floor = str(os.getenv("MINDSHADOW_EXPORT_MIN_QUALITY_FLOOR", "60")).strip()
+        try:
+            main_threshold = int(raw_main_threshold)
+        except ValueError:
+            main_threshold = 75
+        try:
+            support_threshold = int(raw_support_threshold)
+        except ValueError:
+            support_threshold = 68
+        try:
+            quality_floor = int(raw_floor)
+        except ValueError:
+            quality_floor = 60
+        main_threshold = max(0, min(main_threshold, 100))
+        support_threshold = max(0, min(support_threshold, 100))
+        quality_floor = max(0, min(quality_floor, 100))
+        scored_candidates: list[tuple[str, str, int]] = []
+        skipped_candidates: list[dict[str, str]] = []
+        preferred_suffix = self._preferred_term_suffix(source_question=normalized_question)
         for term in terms:
+            if self._is_low_value_term(term):
+                skipped_candidates.append({"term": term, "reason": "low_value_term"})
+                continue
             snippet = self._extract_term_snippet(normalized_answer, term)
-            card_title = f"术语：{term}"
-            next_tags = ["重点术语", "自动收集"]
+            snippet = self._normalize_term_snippet(snippet=snippet, term=term)
+            if not self._is_meaningful_term_snippet(snippet=snippet, term=term):
+                skipped_candidates.append({"term": term, "reason": "weak_snippet"})
+                continue
+            quality = self._term_quality_score(
+                term=term,
+                snippet=snippet,
+                source_question=normalized_question,
+                answer_text=normalized_answer,
+            )
+            quality_scores.append(
+                {
+                    "term": term,
+                    "quality_score": quality,
+                    "passed_floor": quality >= quality_floor,
+                }
+            )
+            if preferred_suffix and not str(term).endswith(preferred_suffix) and quality < 88:
+                skipped_candidates.append({"term": term, "reason": "question_suffix_mismatch"})
+                continue
+            if quality < max(quality_floor, support_threshold):
+                skipped_candidates.append({"term": term, "reason": "quality_below_threshold"})
+                continue
+            scored_candidates.append((term, snippet, quality))
+        scored_candidates.sort(key=lambda item: item[2], reverse=True)
+        if export_gate["allow_term_cards"] and scored_candidates:
+            if scored_candidates[0][2] < main_threshold:
+                export_gate = {
+                    "allow_term_cards": False,
+                    "reject_reason": "low_main_card_quality",
+                    "reject_message": "候选卡片质量不足，已仅保留学习总结卡。",
+                }
+        selected_candidates = scored_candidates[:supporting_limit] if export_gate["allow_term_cards"] else []
+        exported_cards: list[dict[str, Any]] = []
+        llm_generated_count = 0
+        rule_generated_count = 0
+        raw_llm_card_limit = str(os.getenv("MINDSHADOW_EXPORT_LLM_CARD_LIMIT", "1")).strip()
+        try:
+            llm_card_limit = int(raw_llm_card_limit)
+        except ValueError:
+            llm_card_limit = 1
+        llm_card_limit = max(0, min(llm_card_limit, supporting_limit))
+        for index, (term, snippet, quality) in enumerate(selected_candidates):
+            exported_terms.append(term)
+            card_type = self._infer_learning_card_type(
+                source_question=normalized_question,
+                answer_text=normalized_answer,
+                term=term,
+                snippet=snippet,
+            )
+            card_type_label = self._card_type_label(card_type)
+            card_title = f"{card_type_label}：{term}"
+            next_tags = ["重点术语", "自动收集", "学习卡片", f"卡片类型:{card_type_label}"]
+            card_content, generation_mode = self._build_learning_card_content_hybrid(
+                card_type=card_type,
+                term=term,
+                snippet=snippet,
+                source_question=normalized_question,
+                llm_service=llm_service if index < llm_card_limit else None,
+            )
+            if generation_mode == "llm":
+                llm_generated_count += 1
+            else:
+                rule_generated_count += 1
             with self._conn() as conn:
                 existing = conn.execute(
                     """
@@ -2015,20 +2566,31 @@ class MemoryService:
                     (normalized_user_id, card_title),
                 ).fetchone()
             if existing is None:
-                self.create_memory_card(
+                created_card = self.create_memory_card(
                     user_id=normalized_user_id,
                     payload={
                         "title": card_title,
-                        "content": snippet,
+                        "content": card_content,
                         "tags": next_tags,
                     },
                 )
                 term_cards_added += 1
+                exported_cards.append(
+                    {
+                        "id": created_card["id"],
+                        "title": created_card["title"],
+                        "term": term,
+                        "quality_score": quality,
+                        "card_type": card_type,
+                        "is_primary": index == 0,
+                        "generation_mode": generation_mode,
+                    }
+                )
             else:
                 existing_content = str(existing["content"] or "")
-                merged_content = snippet if not existing_content else f"{snippet}\n{existing_content}"
+                merged_content = card_content if not existing_content else f"{card_content}\n{existing_content}"
                 if merged_content != existing_content:
-                    self.update_memory_card(
+                    updated_card = self.update_memory_card(
                         user_id=normalized_user_id,
                         card_id=str(existing["id"]),
                         payload={
@@ -2037,6 +2599,30 @@ class MemoryService:
                         },
                     )
                     term_cards_updated += 1
+                    if updated_card is not None:
+                        exported_cards.append(
+                            {
+                                "id": updated_card["id"],
+                                "title": updated_card["title"],
+                                "term": term,
+                                "quality_score": quality,
+                                "card_type": card_type,
+                                "is_primary": index == 0,
+                                "generation_mode": generation_mode,
+                            }
+                        )
+                else:
+                    exported_cards.append(
+                        {
+                            "id": str(existing["id"]),
+                            "title": card_title,
+                            "term": term,
+                            "quality_score": quality,
+                            "card_type": card_type,
+                            "is_primary": index == 0,
+                            "generation_mode": generation_mode,
+                        }
+                    )
             if has_mistake_signal and len(created_reviews) < 2:
                 created_reviews.append(
                     self.create_review_record(
@@ -2051,11 +2637,43 @@ class MemoryService:
                         },
                     )
                 )
+        experience = self._build_export_experience(
+            export_gate=export_gate,
+            exported_cards=exported_cards,
+            term_cards_added=term_cards_added,
+            term_cards_updated=term_cards_updated,
+        )
         return {
             "summary_card": summary_card,
-            "terms": terms,
+            "terms": exported_terms,
+            "cards": exported_cards,
+            "primary_card_type": exported_cards[0]["card_type"] if exported_cards else None,
+            "card_types": sorted({str(card["card_type"]) for card in exported_cards}),
             "term_cards_added": term_cards_added,
             "term_cards_updated": term_cards_updated,
+            "term_cards_limit": supporting_limit,
+            "generation": {
+                "strategy": "hybrid_guardrailed",
+                "llm_cards": llm_generated_count,
+                "rule_cards": rule_generated_count,
+                "llm_enabled": llm_service is not None,
+                "llm_card_limit": llm_card_limit,
+            },
+            "quality_scores": quality_scores,
+            "candidate_diagnostics": {
+                "candidate_count": len(terms),
+                "selected_count": len(exported_cards),
+                "skipped": skipped_candidates[:8],
+            },
+            "experience": experience,
+            "export_decision": {
+                "allow_term_cards": bool(export_gate["allow_term_cards"]),
+                "reject_reason": export_gate["reject_reason"],
+                "reject_message": export_gate["reject_message"],
+                "main_threshold": main_threshold,
+                "support_threshold": support_threshold,
+                "quality_floor": quality_floor,
+            },
             "review_records_created": len(created_reviews),
             "review_records": created_reviews,
         }

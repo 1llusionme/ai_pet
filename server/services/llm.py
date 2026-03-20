@@ -6,6 +6,7 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+import hashlib
 from typing import Any, Iterator, Optional
 
 from server.services.persona_config import PersonaConfigService
@@ -16,13 +17,29 @@ class LLMService:
         self.provider = os.getenv("MINDSHADOW_LLM_PROVIDER", "mock").strip().lower()
         self.model_name = os.getenv("MINDSHADOW_LLM_MODEL", "gpt-4o-mini")
         self.api_key = os.getenv("MINDSHADOW_LLM_API_KEY", "").strip()
-        self.base_url = os.getenv("MINDSHADOW_LLM_BASE_URL", "https://api.openai.com/v1/chat/completions").strip()
+        self.base_url = self._normalize_chat_endpoint(
+            os.getenv("MINDSHADOW_LLM_BASE_URL", "https://api.openai.com/v1/chat/completions")
+        )
         self.timeout_seconds = int(os.getenv("MINDSHADOW_LLM_TIMEOUT_SECONDS", "30"))
         self.verify_ssl = os.getenv("MINDSHADOW_LLM_VERIFY_SSL", "true").strip().lower() != "false"
         self.chat_max_tokens = int(os.getenv("MINDSHADOW_LLM_CHAT_MAX_TOKENS", "680"))
         self.last_error = ""
         self.last_response_source = "mock"
         self.persona_config_service = PersonaConfigService()
+
+    def _normalize_chat_endpoint(self, raw_url: str) -> str:
+        cleaned = str(raw_url or "").strip().strip("`").strip('"').strip("'").strip()
+        if not cleaned:
+            return "https://api.openai.com/v1/chat/completions"
+        parsed = urllib.parse.urlparse(cleaned)
+        path = str(parsed.path or "").rstrip("/")
+        if path.endswith("/chat/completions"):
+            return cleaned
+        if path in {"", "/"}:
+            return cleaned.rstrip("/") + "/v1/chat/completions"
+        if path.endswith("/v1"):
+            return cleaned.rstrip("/") + "/chat/completions"
+        return cleaned
 
     def _format_learning_reply(self, conclusion: str, reason: str, actions: list[str]) -> str:
         normalized_actions = [str(item).strip() for item in actions if str(item).strip()][:3]
@@ -265,13 +282,52 @@ class LLMService:
         first = concepts[0] if concepts else topic
         return f"我吸收完了。你这次重点是「{topic}」，先从「{first}」开始巩固，晚点我会抽查你。"
 
+    def generate_learning_card_copy(
+        self,
+        card_type: str,
+        term: str,
+        snippet: str,
+        source_question: str,
+    ) -> Optional[dict[str, str]]:
+        normalized_type = str(card_type or "definition").strip()
+        normalized_term = str(term or "").strip()
+        normalized_snippet = str(snippet or "").strip()
+        normalized_question = str(source_question or "").strip()
+        if not normalized_term or not normalized_snippet:
+            return None
+        if self._remote_enabled():
+            remote = self._remote_learning_card_copy(
+                card_type=normalized_type,
+                term=normalized_term,
+                snippet=normalized_snippet,
+                source_question=normalized_question,
+            )
+            if remote:
+                self.last_response_source = "remote"
+                return {
+                    "mode": "llm_remote",
+                    "content": remote,
+                }
+        self.last_response_source = "mock"
+        fallback = self._mock_learning_card_copy(
+            card_type=normalized_type,
+            term=normalized_term,
+            snippet=normalized_snippet,
+            source_question=normalized_question,
+        )
+        return {"mode": "llm_mock", "content": fallback}
+
     def generate_hook(
         self,
         focus_topic: str,
         user_profile: Optional[dict[str, Any]] = None,
         nudge_level: str = "gentle",
+        recent_messages: Optional[list[dict[str, Any]]] = None,
     ) -> str:
-        normalized_topic = self._normalize_focus_topic(focus_topic=focus_topic, recent_messages=[])
+        normalized_topic = self._normalize_focus_topic(
+            focus_topic=focus_topic,
+            recent_messages=recent_messages or [],
+        )
         profile = user_profile or {}
         if self._remote_enabled():
             remote = self._remote_hook(focus_topic=normalized_topic, user_profile=profile, nudge_level=nudge_level)
@@ -296,6 +352,131 @@ class LLMService:
             f"{target_hint}{weak_hint}{level_hint}：你最近在练「{normalized_topic}」，来个30秒小挑战？",
         ]
         return random.choice(hooks)
+
+    def _mock_learning_card_copy(
+        self,
+        card_type: str,
+        term: str,
+        snippet: str,
+        source_question: str,
+    ) -> str:
+        seed = f"{card_type}|{term}|{snippet}"
+        digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
+        variant = int(digest[:2], 16) % 3
+        if card_type == "comparison":
+            conclusions = [
+                f"结论：判断「{term}」时，先定同一比较维度，再下结论。",
+                f"结论：「{term}」要先看共同点，再抓关键差异。",
+                f"结论：遇到「{term}」题，先横向对照，再给判定语句。",
+            ]
+            how_to = [
+                "怎么做：先写共同点，再写差异点，最后补判定句。",
+                "怎么用：作答按“同-异-判”三步展开。",
+                "怎么做：先定维度，再填差异，再回到题干下结论。",
+            ]
+            actions = [
+                f"行动建议：围绕「{term}」做1组A/B对照并口述依据。",
+                f"行动建议：用「{term}」写出2个对比点并给判定句。",
+                f"行动建议：拿「{term}」做一道辨析题，先列维度再作答。",
+            ]
+        elif card_type == "steps":
+            conclusions = [
+                f"结论：「{term}」最稳的做法是按步骤作答。",
+                f"结论：处理「{term}」时，顺序比堆知识更关键。",
+                f"结论：「{term}」应先定位题眼，再按流程输出答案。",
+            ]
+            how_to = [
+                "怎么做：先审题定位关键词，再套步骤，最后自检。",
+                "怎么用：按“定位-展开-检查”三步输出。",
+                "怎么做：先圈题眼，再写步骤，最后补边界条件。",
+            ]
+            actions = [
+                f"行动建议：围绕「{term}」写出3步作答流程并演练1题。",
+                f"行动建议：用「{term}」做1道题，逐步口述每一步目的。",
+                f"行动建议：把「{term}」流程压缩成30秒口头模板。",
+            ]
+        elif card_type == "mistake":
+            conclusions = [
+                f"结论：「{term}」是高频易错点，要先做错因定位。",
+                f"结论：你在「{term}」上更容易错在判断边界。",
+                f"结论：「{term}」要先修正错因，再做同类迁移。",
+            ]
+            how_to = [
+                "怎么做：先复盘错因，再写修正规则，最后做同类题。",
+                "怎么用：按“错因-修正-验证”闭环来巩固。",
+                "怎么做：先说错在哪，再说改法，最后用1题验证。",
+            ]
+            actions = [
+                f"行动建议：围绕「{term}」复述1条判断标准并做1题验证。",
+                f"行动建议：写下「{term}」最易混点和对应纠偏句。",
+                f"行动建议：用「{term}」完成1次错因-修正复盘。",
+            ]
+        elif card_type == "mnemonic":
+            conclusions = [
+                f"结论：「{term}」适合压缩成速记锚点，便于临场调用。",
+                f"结论：记「{term}」先抓顺序词，再抓触发场景。",
+                f"结论：「{term}」可以先记口诀骨架，再补细节。",
+            ]
+            how_to = [
+                "怎么记：先记关键词顺序，再记适用场景。",
+                "怎么用：先背锚点，再用一道题把锚点展开。",
+                "怎么记：先记骨架词，再补判断边界。",
+            ]
+            actions = [
+                f"行动建议：15秒复述「{term}」速记锚点并说适用题型。",
+                f"行动建议：把「{term}」写成一行口诀并口头展开。",
+                f"行动建议：用「{term}」做1次“口诀到答案”转换练习。",
+            ]
+        else:
+            conclusions = [
+                f"结论：理解「{term}」要先抓定义，再抓判断边界。",
+                f"结论：「{term}」先说清“是什么”，再说“怎么判”。",
+                f"结论：作答「{term}」时，定义句和判断点要成对出现。",
+            ]
+            how_to = [
+                "怎么用：先给定义句，再补使用场景或边界。",
+                "怎么做：先说本质，再给1个判断点。",
+                "怎么用：先定义，再举场景，最后补边界。",
+            ]
+            actions = [
+                f"行动建议：用自己的话复述「{term}」并补1个判断点。",
+                f"行动建议：围绕「{term}」先写定义，再写边界句。",
+                f"行动建议：针对「{term}」完成30秒口述+1个例子。",
+            ]
+        return "\n".join(
+            item
+            for item in (
+                conclusions[variant],
+                how_to[variant],
+                actions[variant],
+                f"依据：{snippet}",
+                f"来源问题：{source_question}" if source_question else "",
+            )
+            if item
+        )
+
+    def _remote_learning_card_copy(
+        self,
+        card_type: str,
+        term: str,
+        snippet: str,
+        source_question: str,
+    ) -> str:
+        prompt = (
+            "请输出一张学习卡片正文，必须严格使用这5行标签："
+            "结论：\n怎么用：\n行动建议：\n依据：\n来源问题：。"
+            "结论不能是空话，必须包含术语。行动建议要可在90秒内完成。"
+            f"卡片类型：{card_type}。术语：{term}。证据：{snippet[:300]}。来源问题：{source_question[:200]}。"
+            "只输出卡片正文，不要解释。"
+        )
+        messages = [{"role": "user", "content": prompt}]
+        content = self._post_chat_completion(
+            messages=messages,
+            temperature=0.6,
+            max_tokens=260,
+            timeout_seconds=6,
+        )
+        return content.strip() if content else ""
 
     def generate_daily_plan(self, focus_topic: str, user_profile: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         normalized_topic = self._normalize_focus_topic(focus_topic=focus_topic, recent_messages=[])
@@ -781,7 +962,13 @@ class LLMService:
         except (json.JSONDecodeError, TypeError, ValueError):
             return None
 
-    def _post_chat_completion(self, messages: list[dict[str, Any]], temperature: float, max_tokens: int) -> str:
+    def _post_chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+        timeout_seconds: Optional[int] = None,
+    ) -> str:
         payload = {
             "model": self.model_name,
             "messages": messages,
@@ -801,8 +988,9 @@ class LLMService:
         context = None
         if not self.verify_ssl:
             context = ssl._create_unverified_context()
+        request_timeout = timeout_seconds if isinstance(timeout_seconds, int) and timeout_seconds > 0 else self.timeout_seconds
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds, context=context) as response:
+            with urllib.request.urlopen(request, timeout=request_timeout, context=context) as response:
                 raw = response.read().decode("utf-8")
                 parsed = json.loads(raw)
                 choices = parsed.get("choices", [])
@@ -932,8 +1120,12 @@ class LLMService:
                 break
         if latest_user_text:
             candidate = latest_user_text.replace("\n", " ").strip()
+            candidate = re.sub(r"\s+", " ", candidate)
+            candidate = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9，。！？、\s]", "", candidate).strip()
+            if len(candidate) < 4:
+                return "最近这道题"
             return candidate[:20] + ("..." if len(candidate) > 20 else "")
-        return "当前学习内容"
+        return "最近这道题"
 
     def _should_search_web(self, question: str) -> bool:
         if os.getenv("MINDSHADOW_ENABLE_WEB_SEARCH", "true").strip().lower() == "false":

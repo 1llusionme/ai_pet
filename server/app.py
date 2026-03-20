@@ -43,7 +43,7 @@ def create_app() -> Flask:
     scheduler = ProactiveScheduler(memory_service=memory_service, llm_service=llm_service)
     scheduler.start()
     uploads_dir = Path(os.getenv("MINDSHADOW_UPLOAD_DIR", str(Path(__file__).resolve().parent / "uploads")))
-    web_dist_dir = Path(__file__).resolve().parent.parent / "docs" / "idea2mvp" / "年轻人风格原型设计" / "dist"
+    web_dist_dir = Path(__file__).resolve().parent.parent / "docs" / "idea2mvp" / "teacherexam_ai" / "dist"
     uploads_dir.mkdir(parents=True, exist_ok=True)
     rate_limit_max_requests = int(os.getenv("MINDSHADOW_RATE_LIMIT_MAX_REQUESTS_PER_MINUTE", "20"))
     rate_limit_window_seconds = 60
@@ -1011,16 +1011,9 @@ def create_app() -> Flask:
     @app.route("/api/notifications", methods=["GET"])
     def notifications():
         user_id = request.args.get("user_id", "default")
-        conversation_id = normalize_conversation_id(request.args.get("conversation_id", "default"))
         item = memory_service.pop_pending_notification(user_id=user_id)
         if item is None:
             return jsonify({"notification": None})
-        memory_service.add_message(
-            user_id=user_id,
-            role="ai",
-            content=item["content"],
-            conversation_id=conversation_id,
-        )
         return jsonify({"notification": item})
 
     @app.route("/api/nudge/strategy", methods=["GET", "OPTIONS"])
@@ -1066,11 +1059,24 @@ def create_app() -> Flask:
                 user_id=user_id,
                 source_question=source_question,
                 answer_text=answer_text,
+                llm_service=llm_service,
             )
         except ValueError as exc:
             track_metric("errors")
             return jsonify({"error": str(exc)}), 400
         track_metric("learning_export_requests")
+        decision = exported.get("export_decision", {}) if isinstance(exported, dict) else {}
+        reject_reason = str(decision.get("reject_reason", "")).strip() if isinstance(decision, dict) else ""
+        if reject_reason:
+            track_metric("learning_card_export_rejected")
+        created_count = int(exported.get("term_cards_added", 0) or 0) if isinstance(exported, dict) else 0
+        if created_count > 0:
+            track_metric("learning_card_created")
+        primary_card_type = str(exported.get("primary_card_type", "")).strip() if isinstance(exported, dict) else ""
+        if primary_card_type:
+            safe_type = re.sub(r"[^a-z_]", "", primary_card_type.lower())
+            if safe_type:
+                track_metric(f"learning_card_type_{safe_type}")
         return jsonify({"user_id": user_id, "export": exported})
 
     @app.route("/api/memory-cards", methods=["GET", "OPTIONS", "POST"])
